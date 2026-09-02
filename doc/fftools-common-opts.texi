@@ -22,6 +22,65 @@ ffmpeg -i INPUT -/filter:v filter.script OUTPUT
 @end example
 will load a filtergraph description from the file named @file{filter.script}.
 
+@anchor{Response files}
+@section Response files
+
+A command line consisting of nothing but an argument of the form
+@code{@@@var{filename}} is replaced by the arguments read from
+@file{@var{filename}}. This makes it possible to run commands that would
+otherwise exceed the limit the operating system places on the length of a
+command line, which is easily reached with long filter graphs or a large
+number of inputs.
+
+@example
+ffmpeg @@encode.txt
+@end example
+
+where @file{encode.txt} contains:
+
+@example
+# Input file
+-i input.mp4
+
+# Video encoding settings
+-c:v libx264
+-preset medium
+-crf 23
+
+# Output file
+output.mp4
+@end example
+
+Arguments are separated by whitespace. Quoting follows the conventions of a
+POSIX shell:
+
+@itemize
+@item
+Outside quotes, a backslash escapes the following character, and a backslash
+immediately before a newline continues the line.
+
+@item
+Inside single quotes no character is special until the closing quote.
+
+@item
+Inside double quotes only @code{\"} and @code{\\} are escapes. Every other
+backslash is kept, so a Windows path can be written as it normally is, e.g.
+@code{"C:\Users\me\input.mp4"}. A newline inside double quotes is kept as
+part of the argument, which allows an argument to span several lines.
+
+@item
+Outside quotes, a @code{#} at the beginning of a line starts a comment that
+extends to the end of that line. An argument that begins with @code{#} must
+therefore be quoted.
+
+@item
+An empty quoted string yields an empty argument.
+@end itemize
+
+Only a command line that holds nothing besides @code{@@@var{filename}} is
+expanded. File names may legitimately begin with @code{@@}, so a command such
+as @code{ffmpeg -i @@input.mp4 output.mp4} is left alone.
+
 @anchor{Stream specifiers}
 @section Stream specifiers
 Some options are applied per-stream, e.g. bitrate or codec. Stream specifiers
