@@ -255,6 +255,8 @@ static int response_file_read(const char *filename, char **str)
     AVBPrint bp;
     FILE *f;
     char buf[4096];
+    const char *src;
+    char *dst;
     size_t n;
     int ret;
 
@@ -286,7 +288,24 @@ static int response_file_read(const char *filename, char **str)
         return AVERROR(ENOMEM);
     }
 
-    return av_bprint_finalize(&bp, str);
+    ret = av_bprint_finalize(&bp, str);
+    if (ret < 0)
+        return ret;
+
+    /* Fold CRLF line endings to LF, so that a line break is a single
+     * character everywhere the splitter looks for one: inside quotes, where
+     * the CR would otherwise be kept as part of the argument, and after a
+     * line-continuation backslash, where it would otherwise be escaped
+     * instead of continuing the line. A lone CR is left alone; it does not
+     * terminate a line here and may occur inside a quoted argument. */
+    for (src = dst = *str; *src; src++) {
+        if (src[0] == '\r' && src[1] == '\n')
+            continue;
+        *dst++ = *src;
+    }
+    *dst = 0;
+
+    return 0;
 }
 
 /**
