@@ -228,6 +228,315 @@ static inline void prepare_app_arguments(int *argc_ptr, char ***argv_ptr)
 }
 #endif /* HAVE_COMMANDLINETOARGVW */
 
+/*
+ * Response files.
+ *
+ * A command line consisting of nothing but '@filename' is replaced by the
+ * arguments read from that file. This makes it possible to run commands that
+ * would otherwise exceed the length limit the operating system places on a
+ * command line (32767 characters on Windows, ARG_MAX elsewhere), which is
+ * easily reached with long filter graphs or a large number of inputs.
+ *
+ * Expansion is deliberately restricted to a command line that holds nothing
+ * else: file names may legitimately begin with '@', so expanding the token
+ * wherever it appears would silently change the meaning of existing commands.
+ *
+ * The expanded array is reused by every parsing pass and, like win32_argv_utf8
+ * above, leaked on exit: the option parsers keep pointers into argv for as
+ * long as the program runs.
+ */
+static char **response_file_argv = NULL;
+static int    response_file_argc = 0;
+/* the error a previous attempt failed with, already reported */
+static int    response_file_err  = 0;
+
+static int response_file_read(const char *filename, char **str)
+{
+    AVBPrint bp;
+    FILE *f;
+    char buf[4096];
+    const char *src;
+    char *dst;
+    size_t n;
+    int ret;
+
+    f = fopen_utf8(filename, "rb");
+    if (!f) {
+        ret = AVERROR(errno);
+        av_log(NULL, AV_LOG_FATAL, "Cannot open response file '%s': %s\n",
+               filename, av_err2str(ret));
+        return ret;
+    }
+
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+        av_bprint_append_data(&bp, buf, n);
+
+    /* fread() reports end of file and a read error the same way, so a
+     * truncated read would otherwise be run as if it were the whole command */
+    ret = ferror(f) ? AVERROR(EIO) : 0;
+    fclose(f);
+    if (ret < 0) {
+        av_log(NULL, AV_LOG_FATAL, "Error reading response file '%s'\n",
+               filename);
+        av_bprint_finalize(&bp, NULL);
+        return ret;
+    }
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        return AVERROR(ENOMEM);
+    }
+
+    ret = av_bprint_finalize(&bp, str);
+    if (ret < 0)
+        return ret;
+
+    /* Fold CRLF line endings to LF, so that a line break is a single
+     * character everywhere the splitter looks for one: inside quotes, where
+     * the CR would otherwise be kept as part of the argument, and after a
+     * line-continuation backslash, where it would otherwise be escaped
+     * instead of continuing the line. A lone CR is left alone; it does not
+     * terminate a line here and may occur inside a quoted argument. */
+    for (src = dst = *str; *src; src++) {
+        if (src[0] == '\r' && src[1] == '\n')
+            continue;
+        *dst++ = *src;
+    }
+    *dst = 0;
+
+    return 0;
+}
+
+/**
+ * Split the contents of a response file into arguments.
+ *
+ * Quoting follows POSIX shell conventions:
+ * - outside quotes a backslash escapes the following character, and a
+ *   backslash immediately before a newline continues the line;
+ * - inside single quotes nothing is special until the closing quote;
+ * - inside double quotes only \" and \\ are escapes, so that Windows paths
+ *   survive unmangled, and a newline is kept, allowing multi-line arguments;
+ * - outside quotes '#' at the start of a line begins a comment.
+ *
+ * An empty quoted string ("" or '') yields an empty argument rather than
+ * being dropped, which would shift the value of every later option.
+ */
+static int response_file_split(const char *filename, const char *str,
+                               int *nb_args, char ***args)
+{
+    AVBPrint token;
+    char **argv       = NULL;
+    int    argc       = 0;
+    int    quote      = 0; /* 0, '\'' or '"' */
+    int    have_token = 0; /* tracked separately: a token may be empty */
+    int    line_start = 1;
+    int    comment    = 0;
+    int    ret        = 0;
+    const char *p     = str;
+
+    av_bprint_init(&token, 0, AV_BPRINT_SIZE_UNLIMITED);
+
+#define FLUSH_TOKEN()                                                        \
+    do {                                                                     \
+        if (have_token) {                                                    \
+            char **tmp;                                                      \
+            if (!av_bprint_is_complete(&token)) {                            \
+                ret = AVERROR(ENOMEM);                                       \
+                goto end;                                                    \
+            }                                                                \
+            tmp = av_realloc_array(argv, argc + 2, sizeof(*argv));           \
+            if (!tmp) {                                                      \
+                ret = AVERROR(ENOMEM);                                       \
+                goto end;                                                    \
+            }                                                                \
+            argv = tmp;                                                      \
+            argv[argc] = av_strdup(token.str);                               \
+            if (!argv[argc]) {                                               \
+                ret = AVERROR(ENOMEM);                                       \
+                goto end;                                                    \
+            }                                                                \
+            argc++;                                                      \
+            argv[argc] = NULL;                                             \
+            av_bprint_clear(&token);                                         \
+            have_token = 0;                                                  \
+        }                                                                    \
+    } while (0)
+
+    while (*p) {
+        char c = *p++;
+
+        if (c == '\n') {
+            comment    = 0;
+            line_start = 1;
+            if (quote)
+                av_bprint_chars(&token, c, 1);
+            else
+                FLUSH_TOKEN();
+            continue;
+        }
+
+        if (comment)
+            continue;
+
+        if (!quote) {
+            if (av_isspace(c)) {
+                FLUSH_TOKEN();
+                continue; /* leading blanks leave line_start set */
+            }
+            if (line_start && c == '#') {
+                comment = 1;
+                continue;
+            }
+        }
+
+        line_start = 0;
+
+        if (quote == '\'') {
+            if (c == '\'') {
+                quote = 0;
+                continue;
+            }
+        } else if (c == '\\') {
+            char next = *p;
+            if (!next) {
+                /* trailing backslash, keep it literally */
+            } else if (next == '\n') {
+                p++;
+                continue;
+            } else if (quote == '"' && next != '"' && next != '\\') {
+                /* not an escape inside double quotes, keep the backslash */
+                av_bprint_chars(&token, c, 1);
+                have_token = 1;
+                c = *p++;
+            } else {
+                c = *p++;
+            }
+        } else if (quote == '"') {
+            if (c == '"') {
+                quote = 0;
+                continue;
+            }
+        } else if (c == '"' || c == '\'') {
+            quote      = c;
+            have_token = 1;
+            continue;
+        }
+
+        have_token = 1;
+        av_bprint_chars(&token, c, 1);
+    }
+
+    if (quote) {
+        av_log(NULL, AV_LOG_FATAL,
+               "Unterminated %s quote in response file '%s'\n",
+               quote == '"' ? "double" : "single", filename);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+    FLUSH_TOKEN();
+
+    if (!argc) {
+        av_log(NULL, AV_LOG_FATAL, "Response file '%s' contains no arguments\n",
+               filename);
+        ret = AVERROR_INVALIDDATA;
+        goto end;
+    }
+
+    *nb_args = argc;
+    *args    = argv;
+    argv     = NULL;
+    argc     = 0;
+
+end:
+    av_bprint_finalize(&token, NULL);
+    for (int i = 0; i < argc; i++)
+        av_freep(&argv[i]);
+    av_freep(&argv);
+
+    return ret;
+}
+#undef FLUSH_TOKEN
+
+/**
+ * Perform the system-dependent conversions of prepare_app_arguments() and then
+ * replace a lone '@filename' argument with the contents of that file.
+ *
+ * Both are done here so that every pass over the command line -
+ * parse_loglevel(), parse_options() and split_commandline() - sees the same
+ * arguments. The file is read once and the result cached, including a
+ * failure, so that the diagnostic is printed only once.
+ *
+ * @param argc_ptr Arguments number (including executable)
+ * @param argv_ptr Arguments list
+ * @return 0 on success or a negative AVERROR code
+ */
+static int expand_response_file(int *argc_ptr, char ***argv_ptr)
+{
+    const char *filename;
+    char  *str       = NULL;
+    char **file_argv = NULL;
+    char **argv;
+    int    file_argc = 0;
+    int    ret;
+
+    prepare_app_arguments(argc_ptr, argv_ptr);
+
+    /* the file is read on the first pass over the command line and the result
+     * reused by the later ones, so that it is parsed once and a failure is
+     * reported once */
+    if (response_file_argv) {
+        *argc_ptr = response_file_argc;
+        *argv_ptr = response_file_argv;
+        return 0;
+    }
+    if (response_file_err < 0)
+        return response_file_err;
+
+    if (*argc_ptr != 2 || (*argv_ptr)[1][0] != '@')
+        return 0;
+
+    filename = (*argv_ptr)[1] + 1;
+    if (!*filename) {
+        av_log(NULL, AV_LOG_FATAL, "No file name given after '@'\n");
+        response_file_err = AVERROR(EINVAL);
+        return response_file_err;
+    }
+
+    ret = response_file_read(filename, &str);
+    if (ret >= 0) {
+        ret = response_file_split(filename, str, &file_argc, &file_argv);
+        av_freep(&str);
+    }
+    if (ret < 0) {
+        response_file_err = ret;
+        return ret;
+    }
+
+    /* prepend the program name and NULL-terminate, as C requires of argv */
+    argv = av_malloc_array(file_argc + 2, sizeof(*argv));
+    if (!argv) {
+        for (int i = 0; i < file_argc; i++)
+            av_freep(&file_argv[i]);
+        av_freep(&file_argv);
+        response_file_err = AVERROR(ENOMEM);
+        return response_file_err;
+    }
+    argv[0] = (*argv_ptr)[0];
+    memcpy(argv + 1, file_argv, file_argc * sizeof(*argv));
+    argv[file_argc + 1] = NULL;
+    av_freep(&file_argv);
+
+    response_file_argc = file_argc + 1;
+    response_file_argv = argv;
+
+    *argc_ptr = response_file_argc;
+    *argv_ptr = response_file_argv;
+
+    return 0;
+}
+
 static int opt_has_arg(const OptionDef *o)
 {
     if (o->type == OPT_TYPE_BOOL)
@@ -423,8 +732,11 @@ int parse_options(void *optctx, int argc, char **argv, const OptionDef *options,
     const char *opt;
     int optindex, handleoptions = 1, ret;
 
-    /* perform system-dependent conversions for arguments list */
-    prepare_app_arguments(&argc, &argv);
+    /* perform system-dependent conversions for arguments list
+     * and expand a response file, if one was given */
+    ret = expand_response_file(&argc, &argv);
+    if (ret < 0)
+        return ret;
 
     /* parse options */
     optindex = 1;
@@ -559,6 +871,10 @@ void parse_loglevel(int argc, char **argv, const OptionDef *options)
     char *env;
 
     check_options(options);
+
+    /* the command line cannot be inspected before a response file has been
+     * expanded; a failure here is reported by the option parser later on */
+    expand_response_file(&argc, &argv);
 
     idx = locate_option(argc, argv, options, "loglevel");
     if (!idx)
@@ -795,8 +1111,11 @@ int split_commandline(OptionParseContext *octx, int argc, char *argv[],
     int optindex = 1;
     int dashdash = -2;
 
-    /* perform system-dependent conversions for arguments list */
-    prepare_app_arguments(&argc, &argv);
+    /* perform system-dependent conversions for arguments list
+     * and expand a response file, if one was given */
+    ret = expand_response_file(&argc, &argv);
+    if (ret < 0)
+        return ret;
 
     ret = init_parse_context(octx, groups, nb_groups);
     if (ret < 0)
