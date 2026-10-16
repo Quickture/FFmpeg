@@ -258,6 +258,7 @@ static int response_file_read(const char *filename, char **str)
     const char *src;
     char *dst;
     size_t n;
+    unsigned len;
     int ret;
 
     f = fopen_utf8(filename, "rb");
@@ -288,19 +289,38 @@ static int response_file_read(const char *filename, char **str)
         return AVERROR(ENOMEM);
     }
 
+    len = bp.len;
     ret = av_bprint_finalize(&bp, str);
     if (ret < 0)
         return ret;
+
+    /* The splitter stops at the first NUL, which would silently drop the
+     * rest of the file. This also catches a file saved as UTF-16. */
+    if (memchr(*str, 0, len)) {
+        av_log(NULL, AV_LOG_FATAL, "Response file '%s' contains a NUL byte; "
+               "it must be encoded in UTF-8\n", filename);
+        av_freep(str);
+        return AVERROR_INVALIDDATA;
+    }
+
+    /* Skip a UTF-8 byte order mark, which would otherwise be glued to the
+     * first argument. */
+    src = *str;
+    av_strstart(src, "\xEF\xBB\xBF", &src);
 
     /* Fold CRLF line endings to LF, so that a line break is a single
      * character everywhere the splitter looks for one: inside quotes, where
      * the CR would otherwise be kept as part of the argument, and after a
      * line-continuation backslash, where it would otherwise be escaped
-     * instead of continuing the line. A lone CR is left alone; it does not
-     * terminate a line here and may occur inside a quoted argument. */
-    for (src = dst = *str; *src; src++) {
-        if (src[0] == '\r' && src[1] == '\n')
-            continue;
+     * instead of continuing the line. The whole run of CRs before a LF is
+     * dropped, so that CRCRLF, which a program writing CRLF to a text-mode
+     * stream on Windows produces, is folded too. A CR not followed by a LF
+     * is left alone; it does not terminate a line here and may occur inside
+     * a quoted argument. */
+    for (dst = *str; *src; src++) {
+        if (*src == '\n')
+            while (dst > *str && dst[-1] == '\r')
+                dst--;
         *dst++ = *src;
     }
     *dst = 0;

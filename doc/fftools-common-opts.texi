@@ -77,6 +77,16 @@ therefore be quoted.
 An empty quoted string yields an empty argument.
 @end itemize
 
+The file must be encoded in UTF-8. A leading byte order mark is ignored, and
+a file containing a NUL byte, such as one saved as UTF-16, is rejected.
+
+Line endings are normalized: a CRLF, or any run of carriage returns followed
+by a line feed, is treated as a single line break, so a file written on
+Windows behaves the same as one written on Unix, including inside quotes and
+after a line-continuation backslash. A carriage return immediately before a
+line break therefore cannot be part of an argument. A carriage return not
+followed by a line feed does not end a line.
+
 Only a command line that holds nothing besides @code{@@@var{filename}} is
 expanded. File names may legitimately begin with @code{@@}, so a command such
 as @code{ffmpeg -i @@input.mp4 output.mp4} is left alone.
